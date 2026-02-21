@@ -2,10 +2,10 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 build: *std.Build,
-sdk_paths: SdkPaths,
+sdk_paths: *SdkPaths,
 
 pub fn init(b: *std.Build, target: std.Build.ResolvedTarget, api_level: u32) !@This() {
-    const sdk_paths = try SdkPaths.get(b, target, api_level);
+    const sdk_paths = try SdkPaths.init(b, target, api_level);
 
     const supported = switch (target.result.cpu.arch) {
         .x86_64, .aarch64 => switch (target.result.os.tag) {
@@ -25,10 +25,19 @@ pub fn init(b: *std.Build, target: std.Build.ResolvedTarget, api_level: u32) !@T
     };
 }
 
-pub fn addRunBuildTool(self: *@This(), name: []const u8) !*std.Build.Step.Run {
+pub fn addRunBuildTool(self: *@This(), name: []const u8) *std.Build.Step.Run {
     const b = self.build;
-    const path = b.pathResolve(&.{ self.sdk_paths.build_tools, name });
-    const run_cmd = b.addSystemCommand(&.{path});
+    const run_cmd = b.addSystemCommand(&.{name});
+    run_cmd.argv.clearRetainingCapacity();
+    run_cmd.addFileArg(self.sdk_paths.build_tools.path(self.build, name));
+    return run_cmd;
+}
+
+pub fn addRunPlatformTool(self: *@This(), name: []const u8) *std.Build.Step.Run {
+    const b = self.build;
+    const run_cmd = b.addSystemCommand(&.{name});
+    run_cmd.argv.clearRetainingCapacity();
+    run_cmd.addFileArg(self.sdk_paths.platform_tools.path(self.build, name));
     return run_cmd;
 }
 
@@ -50,16 +59,87 @@ pub fn addLibrary(self: *@This(), options: std.Build.LibraryOptions) *std.Build.
 }
 
 const SdkPaths = struct {
-    sdk_root: []const u8,
-    build_tools: []const u8,
-    ndk_root: []const u8,
+    step: std.Build.Step,
+    api_level: u32,
+
+    _sdk_dir: std.Build.GeneratedFile,
+    sdk_root: std.Build.LazyPath,
+    platform_tools: std.Build.LazyPath,
+
+    _build_tools_dir: std.Build.GeneratedFile,
+    build_tools: std.Build.LazyPath,
+
+    _ndk_dir: std.Build.GeneratedFile,
+    ndk_root: std.Build.LazyPath,
 
     include_dir: std.Build.LazyPath,
     sys_include_dir: std.Build.LazyPath,
     crt_dir: std.Build.LazyPath,
+
+    _wf: *std.Build.Step.WriteFile,
     libc_file: std.Build.LazyPath,
 
-    fn get(b: *std.Build, target: std.Build.ResolvedTarget, api_level: u32) !SdkPaths {
+    fn init(b: *std.Build, target: std.Build.ResolvedTarget, api_level: u32) !*SdkPaths {
+        const host_os = builtin.os.tag;
+        const host_arch = builtin.cpu.arch;
+        const prebuilt_dir = switch (host_os) {
+            .linux => "linux-x86_64",
+            .macos => if (host_arch == .aarch64) "darwin-arm64" else "darwin-x86_64",
+            .windows => "windows-x86_64",
+            else => return error.UnsupportedHostOs,
+        };
+        const sysroot = b.pathJoin(&.{
+            "toolchains/llvm/prebuilt",
+            prebuilt_dir,
+            "sysroot",
+        });
+        const system_target = switch (target.result.cpu.arch) {
+            .x86_64 => "x86_64-linux-android",
+            .aarch64 => "aarch64-linux-android",
+            else => return error.UnsupportedTarget,
+        };
+
+        const self = b.allocator.create(SdkPaths) catch @panic("OOM");
+        self.* = .{
+            .step = .init(.{
+                .id = .custom,
+                .name = "resolve-android-sdk",
+                .owner = b,
+                .makeFn = make,
+            }),
+            .api_level = api_level,
+
+            ._sdk_dir = .{ .step = &self.step },
+            .sdk_root = .{ .generated = .{ .file = &self._sdk_dir } },
+            .platform_tools = self.sdk_root.path(b, "platform-tools"),
+
+            ._build_tools_dir = .{ .step = &self.step },
+            .build_tools = .{ .generated = .{ .file = &self._build_tools_dir } },
+
+            ._ndk_dir = .{ .step = &self.step },
+            .ndk_root = .{ .generated = .{ .file = &self._ndk_dir } },
+
+            .include_dir = self.ndk_root.path(b, b.pathJoin(&.{ sysroot, "usr/include" })),
+            .sys_include_dir = self.include_dir.path(b, system_target),
+            .crt_dir = self.ndk_root.path(b, b.pathJoin(&.{
+                sysroot,
+                "usr/lib",
+                system_target,
+                b.fmt("{d}", .{self.api_level}),
+            })),
+
+            ._wf = b.addWriteFiles(),
+            .libc_file = self._wf.getDirectory().path(b, "android-libc.conf"),
+        };
+        self._wf.step.dependOn(&self.step);
+
+        return self;
+    }
+
+    fn make(step: *std.Build.Step, _: std.Build.Step.MakeOptions) !void {
+        const b = step.owner;
+        const self: *SdkPaths = @fieldParentPtr("step", step);
+
         // search for android sdk
         var env = if (@hasField(std.Build.Graph, "environ_map"))
             b.graph.environ_map
@@ -159,46 +239,24 @@ const SdkPaths = struct {
             break :blk b.pathResolve(&.{ ndk_base, latest_ndk_version });
         };
 
-        // create libc file
-        const host_os = builtin.os.tag;
-        const host_arch = builtin.cpu.arch;
-        const prebuilt_dir = switch (host_os) {
-            .linux => "linux-x86_64",
-            .macos => if (host_arch == .aarch64) "darwin-arm64" else "darwin-x86_64",
-            .windows => "windows-x86_64",
-            else => return error.UnsupportedHostOs,
-        };
-        const sysroot = b.pathResolve(&.{
-            ndk_root,
-            "toolchains/llvm/prebuilt",
-            prebuilt_dir,
-            "sysroot",
-        });
-        const system_target = switch (target.result.cpu.arch) {
-            .x86_64 => "x86_64-linux-android",
-            .aarch64 => "aarch64-linux-android",
-            else => return error.UnsupportedTarget,
-        };
+        self._sdk_dir.path = android_sdk_root;
+        self._build_tools_dir.path = build_tools_dir;
+        self._ndk_dir.path = ndk_root;
 
-        const include_dir = b.pathResolve(&.{ sysroot, "usr/include" });
-        const sys_include_dir = b.pathResolve(&.{ include_dir, system_target });
-        const crt_dir = b.pathResolve(&.{
-            sysroot,
-            "usr/lib",
-            system_target,
-            b.fmt("{d}", .{api_level}),
-        });
+        // create libc file
+        const include_dir = try self.include_dir.getPath3(b, step).toString(b.allocator);
+        const sys_include_dir = try self.sys_include_dir.getPath3(b, step).toString(b.allocator);
+        const crt_dir = try self.crt_dir.getPath3(b, step).toString(b.allocator);
 
         if (!try dirExists(b, crt_dir)) {
             std.log.err(
                 "API level {d} not found in NDK sysroot. Directory '{s}' does not exist. " ++
                     "Check your installed NDK for available API levels.",
-                .{ api_level, crt_dir },
+                .{ self.api_level, crt_dir },
             );
             return error.InvalidApiLevel;
         }
 
-        const wf = b.addWriteFiles();
         const libc_contents = b.fmt(
             \\# Generated by zig-android-sdk. DO NOT EDIT.
             \\
@@ -226,18 +284,7 @@ const SdkPaths = struct {
             \\
             \\gcc_dir=
         , .{ include_dir, sys_include_dir, crt_dir });
-        const libc_file = wf.add("android-libc.conf", libc_contents);
-
-        return .{
-            .sdk_root = android_sdk_root,
-            .build_tools = build_tools_dir,
-            .ndk_root = ndk_root,
-
-            .include_dir = .{ .cwd_relative = include_dir },
-            .sys_include_dir = .{ .cwd_relative = sys_include_dir },
-            .crt_dir = .{ .cwd_relative = crt_dir },
-            .libc_file = libc_file,
-        };
+        _ = self._wf.add("android-libc.conf", libc_contents);
     }
 
     fn findLatestVersionDir(b: *std.Build, base: []const u8) !?[]const u8 {
