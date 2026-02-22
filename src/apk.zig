@@ -10,6 +10,7 @@ manifest: Manifest,
 wf: *std.Build.Step.WriteFile,
 step: std.Build.Step,
 aligned_apk: std.Build.LazyPath,
+resource_symbols_txt: std.Build.LazyPath,
 
 pub const CreateOptions = struct {
     manifest: Manifest,
@@ -33,6 +34,7 @@ pub fn create(sdk: *Sdk, options: CreateOptions) !*Application {
         .wf = wf,
         .manifest = options.manifest,
         .aligned_apk = undefined,
+        .resource_symbols_txt = undefined,
     };
     self.step.dependOn(&sdk_paths.step);
     wf.step.dependOn(&self.step);
@@ -56,7 +58,7 @@ pub fn create(sdk: *Sdk, options: CreateOptions) !*Application {
     const compiled_res = aapt2_compile.addOutputFileArg("compiled-res.zip");
     aapt2_compile.step.dependOn(&wf.step);
 
-    // aapt2 link --manifest AndroidManifest.xml -I android.jar -R compiled-res.zip -o unaligned.apk
+    // aapt2 link --manifest AndroidManifest.xml -I android.jar compiled-res.zip -o unaligned.apk
     const aapt2_link = sdk.addRunBuildTool("aapt2");
     aapt2_link.addArg("link");
     aapt2_link.addArg("--manifest");
@@ -69,6 +71,8 @@ pub fn create(sdk: *Sdk, options: CreateOptions) !*Application {
         aapt2_link.addDirectoryArg(assets_dir);
         try util.addDirectoryFileInputs(aapt2_link, assets_dir);
     }
+    aapt2_link.addArg("--output-text-symbols");
+    const symbols_txt = aapt2_link.addOutputFileArg("R.txt");
     aapt2_link.addArg("-o");
     const unaligned_apk = aapt2_link.addOutputFileArg(b.fmt("{s}.unaligned.apk", .{options.manifest.package}));
     aapt2_link.step.dependOn(&aapt2_compile.step);
@@ -99,6 +103,7 @@ pub fn create(sdk: *Sdk, options: CreateOptions) !*Application {
     apksigner.step.dependOn(&zipalign.step);
 
     self.aligned_apk = signed_apk;
+    self.resource_symbols_txt = symbols_txt;
 
     return self;
 }

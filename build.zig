@@ -38,6 +38,7 @@ fn buildExample(b: *std.Build, optimize: std.builtin.OptimizeMode) !*Sdk.Applica
             },
         },
         .res_dir = b.path("example/res"),
+        .assets_dir = b.path("example/assets"),
     });
 
     const targets: []const std.Target.Query = &.{
