@@ -1,5 +1,6 @@
 const std = @import("std");
 const Sdk = @import("sdk.zig");
+const util = @import("util.zig");
 pub const Manifest = @import("android_manifest.zig");
 
 const Application = @This();
@@ -12,6 +13,8 @@ aligned_apk: std.Build.LazyPath,
 
 pub const CreateOptions = struct {
     manifest: Manifest,
+    res_dir: ?std.Build.LazyPath = null,
+    assets_dir: ?std.Build.LazyPath = null,
 };
 
 pub fn create(sdk: *Sdk, options: CreateOptions) !*Application {
@@ -36,25 +39,56 @@ pub fn create(sdk: *Sdk, options: CreateOptions) !*Application {
 
     const wf_dir = wf.getDirectory();
     const manifest_path = wf_dir.path(b, "work/AndroidManifest.xml");
+    const res_dir = if (options.res_dir) |dir|
+        dir
+    else blk: {
+        _ = wf.add("build/res/values/strings.xml", "<resources/>\n");
+        break :blk wf_dir.path(b, "build/res");
+    };
 
-    // aapt package -f -M AndroidManifest.xml -I android.jar -F unaligned.apk <raw-dir>
-    const aapt = sdk.addRunBuildTool("aapt");
-    aapt.addArgs(&.{ "package", "-f" });
-    aapt.addArg("-M");
-    aapt.addFileArg(manifest_path);
-    aapt.addArg("-I");
-    aapt.addFileArg(sdk_paths.android_jar);
-    aapt.addArg("-F");
-    const unaligned_apk = aapt.addOutputFileArg(b.fmt("{s}.unaligned.apk", .{options.manifest.package}));
-    aapt.addDirectoryArg(wf_dir.path(b, "build"));
-    aapt.step.dependOn(&wf.step);
+    // aapt2 compile --dir build/res -o compiled-res.zip
+    const aapt2_compile = sdk.addRunBuildTool("aapt2");
+    aapt2_compile.addArg("compile");
+    aapt2_compile.addArg("--dir");
+    aapt2_compile.addDirectoryArg(res_dir);
+    try util.addDirectoryFileInputs(aapt2_compile, res_dir);
+    aapt2_compile.addArg("-o");
+    const compiled_res = aapt2_compile.addOutputFileArg("compiled-res.zip");
+    aapt2_compile.step.dependOn(&wf.step);
+
+    // aapt2 link --manifest AndroidManifest.xml -I android.jar -R compiled-res.zip -o unaligned.apk
+    const aapt2_link = sdk.addRunBuildTool("aapt2");
+    aapt2_link.addArg("link");
+    aapt2_link.addArg("--manifest");
+    aapt2_link.addFileArg(manifest_path);
+    aapt2_link.addArg("-I");
+    aapt2_link.addFileArg(sdk_paths.android_jar);
+    aapt2_link.addFileArg(compiled_res);
+    if (options.assets_dir) |assets_dir| {
+        aapt2_link.addArg("-A");
+        aapt2_link.addDirectoryArg(assets_dir);
+        try util.addDirectoryFileInputs(aapt2_link, assets_dir);
+    }
+    aapt2_link.addArg("-o");
+    const unaligned_apk = aapt2_link.addOutputFileArg(b.fmt("{s}.unaligned.apk", .{options.manifest.package}));
+    aapt2_link.step.dependOn(&aapt2_compile.step);
+
+    // jar uf unaligned.apk -C build lib
+    const add_native_libs = b.addSystemCommand(&.{"jar"});
+    add_native_libs.addArgs(&.{"uf"});
+    add_native_libs.addFileArg(unaligned_apk);
+    add_native_libs.addArgs(&.{"-C"});
+    add_native_libs.addDirectoryArg(wf_dir.path(b, "build"));
+    add_native_libs.addArg("lib");
+    add_native_libs.step.dependOn(&aapt2_link.step);
+    add_native_libs.step.dependOn(&wf.step);
 
     // zipalign -f 4 unaligned.apk aligned.apk
     const zipalign = sdk.addRunBuildTool("zipalign");
     zipalign.addArgs(&.{ "-f", "4" });
     zipalign.addFileArg(unaligned_apk);
     const aligned_apk = zipalign.addOutputFileArg(b.fmt("{s}.apk", .{options.manifest.package}));
-    zipalign.step.dependOn(&aapt.step);
+    zipalign.step.dependOn(&add_native_libs.step);
 
     const apksigner = sdk.addRunBuildTool("apksigner");
     apksigner.addArgs(&.{ "sign", "--ks" });

@@ -20,7 +20,7 @@ fn buildExample(b: *std.Build, optimize: std.builtin.OptimizeMode) !*Sdk.Applica
                 .android_targetSdkVersion = 29,
             },
             .application = .{
-                .android_label = "Example App",
+                .android_label = "@string/app_name",
                 .android_hasCode = false,
                 .activity = &.{
                     Sdk.Application.Manifest.Activity{
@@ -37,6 +37,7 @@ fn buildExample(b: *std.Build, optimize: std.builtin.OptimizeMode) !*Sdk.Applica
                 },
             },
         },
+        .res_dir = b.path("example/res"),
     });
 
     const targets: []const std.Target.Query = &.{
@@ -48,7 +49,7 @@ fn buildExample(b: *std.Build, optimize: std.builtin.OptimizeMode) !*Sdk.Applica
         _ = example.addLibrary(.{
             .name = "main",
             .root_module = b.createModule(.{
-                .root_source_file = b.path("example.zig"),
+                .root_source_file = b.path("example/main.zig"),
                 .target = b.resolveTargetQuery(target_query),
                 .optimize = optimize,
             }),

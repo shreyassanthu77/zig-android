@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const util = @import("util.zig");
 pub const Application = @import("apk.zig");
 
 build: *std.Build,
@@ -416,7 +417,7 @@ const SdkPaths = struct {
     /// Scan `<sdk_root>/platforms/` for `android-N` directories and return the
     /// directory name with the highest N that is <= `max_level`.
     fn findBestPlatform(b: *std.Build, platforms_base: []const u8, max_level: u32) !?[]const u8 {
-        var it = try DirIterator.init(b, platforms_base);
+        var it = try util.DirIterator.init(b, platforms_base);
         defer it.deinit();
 
         var best: ?u32 = null;
@@ -439,7 +440,7 @@ const SdkPaths = struct {
     /// numeric API-level subdirectories and return the string of the highest one
     /// that is <= `max_level`.
     fn findBestCrtApiLevel(b: *std.Build, arch_lib_base: []const u8, max_level: u32) !?[]const u8 {
-        var it = DirIterator.init(b, arch_lib_base) catch |err| switch (err) {
+        var it = util.DirIterator.init(b, arch_lib_base) catch |err| switch (err) {
             error.FileNotFound => return null,
             else => |e| return e,
         };
@@ -460,7 +461,7 @@ const SdkPaths = struct {
     }
 
     fn findLatestVersionDir(b: *std.Build, base: []const u8) !?[]const u8 {
-        var it = try DirIterator.init(b, base);
+        var it = try util.DirIterator.init(b, base);
         defer it.deinit();
 
         var latest_ver: ?std.SemanticVersion = null;
@@ -480,49 +481,6 @@ const SdkPaths = struct {
         }
         return if (latest_ver) |_| b.dupe(latest_ver_str.?) else null;
     }
-
-    const DirIterator = struct {
-        const has_io = @hasDecl(std, "Io") and @hasDecl(std.Io, "Dir");
-        const Dir = if (has_io) std.Io.Dir else std.fs.Dir;
-        const Iter = Dir.Iterator;
-
-        b: *std.Build,
-        dir: Dir,
-        it: Iter,
-
-        fn init(b: *std.Build, path: []const u8) !DirIterator {
-            const dir = if (has_io) try std.Io.Dir.openDirAbsolute(b.graph.io, path, .{
-                .iterate = true,
-                .access_sub_paths = false,
-            }) else try std.fs.openDirAbsolute(path, .{
-                .iterate = true,
-                .access_sub_paths = false,
-            });
-
-            const it = dir.iterate();
-            return DirIterator{
-                .b = b,
-                .dir = dir,
-                .it = it,
-            };
-        }
-
-        fn deinit(self: *DirIterator) void {
-            if (has_io) {
-                self.dir.close(self.b.graph.io);
-            } else {
-                self.dir.close();
-            }
-        }
-
-        fn next(self: *DirIterator) !?Dir.Entry {
-            if (has_io) {
-                return try self.it.next(self.b.graph.io);
-            } else {
-                return try self.it.next();
-            }
-        }
-    };
 
     fn pathExists(b: *std.Build, path: []const u8) !bool {
         if (@hasDecl(std, "Io") and @hasDecl(std.Io, "Dir") and @hasDecl(std.Io.Dir, "accessAbsolute")) {
