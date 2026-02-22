@@ -93,7 +93,7 @@ pub fn getDebugKeystore(self: *@This()) std.Build.LazyPath {
     if (builtin.zig_version.major == 0 and builtin.zig_version.minor <= 15) {
         _ = keytool.captureStdErr();
     } else {
-        _ = keytool.captureStdOut(.{});
+        _ = keytool.captureStdErr(.{});
     }
 
     const keystore = keytool.addOutputFileArg("debug.keystore");
@@ -112,6 +112,7 @@ pub fn getDebugKeystore(self: *@This()) std.Build.LazyPath {
 const SdkPaths = struct {
     step: std.Build.Step,
     api_level: u32,
+    sysroot_prefix: []const u8,
 
     _sdk_dir: std.Build.GeneratedFile,
     sdk_root: std.Build.LazyPath,
@@ -123,6 +124,7 @@ const SdkPaths = struct {
     _ndk_dir: std.Build.GeneratedFile,
     ndk_root: std.Build.LazyPath,
 
+    _android_jar_file: std.Build.GeneratedFile,
     android_jar: std.Build.LazyPath,
 
     _wf: *std.Build.Step.WriteFile,
@@ -135,6 +137,7 @@ const SdkPaths = struct {
         resolved: bool = false,
         include_dir: std.Build.LazyPath,
         sys_include_dir: std.Build.LazyPath,
+        _crt_dir_file: std.Build.GeneratedFile,
         crt_dir: std.Build.LazyPath,
         libc_file: std.Build.LazyPath,
     };
@@ -163,6 +166,7 @@ const SdkPaths = struct {
                 .makeFn = make,
             }),
             .api_level = api_level,
+            .sysroot_prefix = sysroot,
 
             ._sdk_dir = .{ .step = &self.step },
             .sdk_root = .{ .generated = .{ .file = &self._sdk_dir } },
@@ -174,34 +178,23 @@ const SdkPaths = struct {
             ._ndk_dir = .{ .step = &self.step },
             .ndk_root = .{ .generated = .{ .file = &self._ndk_dir } },
 
-            .android_jar = self.sdk_root.path(b, b.pathJoin(&.{
-                "platforms",
-                b.fmt("android-{d}", .{api_level}),
-                "android.jar",
-            })),
+            ._android_jar_file = .{ .step = &self.step },
+            .android_jar = .{ .generated = .{ .file = &self._android_jar_file } },
 
             ._wf = b.addWriteFiles(),
             .lib_paths = .{
                 .x86_64 = .{
                     .include_dir = self.ndk_root.path(b, b.pathJoin(&.{ sysroot, "usr/include" })),
                     .sys_include_dir = self.lib_paths.x86_64.include_dir.path(b, "x86_64-linux-android"),
-                    .crt_dir = self.ndk_root.path(b, b.pathJoin(&.{
-                        sysroot,
-                        "usr/lib",
-                        "x86_64-linux-android",
-                        b.fmt("{d}", .{self.api_level}),
-                    })),
+                    ._crt_dir_file = .{ .step = &self.step },
+                    .crt_dir = .{ .generated = .{ .file = &self.lib_paths.x86_64._crt_dir_file } },
                     .libc_file = self._wf.getDirectory().path(b, "android-libc-x86_64.conf"),
                 },
                 .aarch64 = .{
                     .include_dir = self.ndk_root.path(b, b.pathJoin(&.{ sysroot, "usr/include" })),
                     .sys_include_dir = self.lib_paths.aarch64.include_dir.path(b, "aarch64-linux-android"),
-                    .crt_dir = self.ndk_root.path(b, b.pathJoin(&.{
-                        sysroot,
-                        "usr/lib",
-                        "aarch64-linux-android",
-                        b.fmt("{d}", .{self.api_level}),
-                    })),
+                    ._crt_dir_file = .{ .step = &self.step },
+                    .crt_dir = .{ .generated = .{ .file = &self.lib_paths.aarch64._crt_dir_file } },
                     .libc_file = self._wf.getDirectory().path(b, "android-libc-aarch64.conf"),
                 },
             },
@@ -318,23 +311,35 @@ const SdkPaths = struct {
         self._build_tools_dir.path = build_tools_dir;
         self._ndk_dir.path = ndk_root;
 
-        const android_jar = try self.android_jar.getPath3(b, step).toString(b.allocator);
-        if (!try pathExists(b, android_jar)) {
+        // Resolve android.jar: find the best installed platform <= requested API level
+        const platforms_base = b.pathResolve(&.{ android_sdk_root, "platforms" });
+        const best_platform = try findBestPlatform(b, platforms_base, self.api_level) orelse {
             std.log.err(
-                "android.jar not found for API level {d}. Expected at '{s}'. " ++
-                    "Make sure the Android SDK platform for API level {d} is installed " ++
-                    "(install via `sdkmanager \"platforms;android-{d}\"`).",
-                .{ self.api_level, android_jar, self.api_level, self.api_level },
+                "No suitable Android platform found for API level {d}. " ++
+                    "No installed platform with API level <= {d} exists under '{s}'. " ++
+                    "Install one via `sdkmanager \"platforms;android-{d}\"`.",
+                .{ self.api_level, self.api_level, platforms_base, self.api_level },
+            );
+            return error.AndroidPlatformNotFound;
+        };
+        const android_jar_path = b.pathResolve(&.{ platforms_base, best_platform, "android.jar" });
+        if (!try pathExists(b, android_jar_path)) {
+            std.log.err(
+                "android.jar not found at '{s}'. The platform directory exists but appears incomplete.",
+                .{android_jar_path},
             );
             return error.AndroidPlatformNotFound;
         }
+        self._android_jar_file.path = android_jar_path;
 
-        // x86_64 lib paths
+        // x86_64 lib paths - resolve CRT dir with API level fallback
         const x86_64_include_dir = try self.lib_paths.x86_64.include_dir.getPath3(b, step).toString(b.allocator);
         const x86_64_sys_include_dir = try self.lib_paths.x86_64.sys_include_dir.getPath3(b, step).toString(b.allocator);
-        const x86_64_crt_dir = try self.lib_paths.x86_64.crt_dir.getPath3(b, step).toString(b.allocator);
 
-        if (try pathExists(b, x86_64_crt_dir)) {
+        const x86_64_lib_base = b.pathResolve(&.{ ndk_root, self.sysroot_prefix, "usr/lib", "x86_64-linux-android" });
+        if (try findBestCrtApiLevel(b, x86_64_lib_base, self.api_level)) |best_level| {
+            const x86_64_crt_dir = b.pathResolve(&.{ x86_64_lib_base, best_level });
+            self.lib_paths.x86_64._crt_dir_file.path = x86_64_crt_dir;
             self.lib_paths.x86_64.resolved = true;
 
             const x86_64_libc_contents = b.fmt(
@@ -367,12 +372,14 @@ const SdkPaths = struct {
             _ = self._wf.add("android-libc-x86_64.conf", x86_64_libc_contents);
         }
 
-        // aarch64 lib paths
+        // aarch64 lib paths - resolve CRT dir with API level fallback
         const aarch64_include_dir = try self.lib_paths.aarch64.include_dir.getPath3(b, step).toString(b.allocator);
         const aarch64_sys_include_dir = try self.lib_paths.aarch64.sys_include_dir.getPath3(b, step).toString(b.allocator);
-        const aarch64_crt_dir = try self.lib_paths.aarch64.crt_dir.getPath3(b, step).toString(b.allocator);
 
-        if (try pathExists(b, aarch64_crt_dir)) {
+        const aarch64_lib_base = b.pathResolve(&.{ ndk_root, self.sysroot_prefix, "usr/lib", "aarch64-linux-android" });
+        if (try findBestCrtApiLevel(b, aarch64_lib_base, self.api_level)) |best_level| {
+            const aarch64_crt_dir = b.pathResolve(&.{ aarch64_lib_base, best_level });
+            self.lib_paths.aarch64._crt_dir_file.path = aarch64_crt_dir;
             self.lib_paths.aarch64.resolved = true;
 
             const aarch64_libc_contents = b.fmt(
@@ -404,6 +411,52 @@ const SdkPaths = struct {
             , .{ aarch64_include_dir, aarch64_sys_include_dir, aarch64_crt_dir });
             _ = self._wf.add("android-libc-aarch64.conf", aarch64_libc_contents);
         }
+    }
+
+    /// Scan `<sdk_root>/platforms/` for `android-N` directories and return the
+    /// directory name with the highest N that is <= `max_level`.
+    fn findBestPlatform(b: *std.Build, platforms_base: []const u8, max_level: u32) !?[]const u8 {
+        var it = try DirIterator.init(b, platforms_base);
+        defer it.deinit();
+
+        var best: ?u32 = null;
+        var best_name: ?[]const u8 = null;
+        while (try it.next()) |entry| {
+            if (entry.kind != .directory) continue;
+            const prefix = "android-";
+            if (!std.mem.startsWith(u8, entry.name, prefix)) continue;
+            const level = std.fmt.parseInt(u32, entry.name[prefix.len..], 10) catch continue;
+            if (level > max_level) continue;
+            if (best == null or level > best.?) {
+                best = level;
+                best_name = b.dupe(entry.name);
+            }
+        }
+        return best_name;
+    }
+
+    /// Scan an NDK arch lib directory (e.g. `usr/lib/aarch64-linux-android/`) for
+    /// numeric API-level subdirectories and return the string of the highest one
+    /// that is <= `max_level`.
+    fn findBestCrtApiLevel(b: *std.Build, arch_lib_base: []const u8, max_level: u32) !?[]const u8 {
+        var it = DirIterator.init(b, arch_lib_base) catch |err| switch (err) {
+            error.FileNotFound => return null,
+            else => |e| return e,
+        };
+        defer it.deinit();
+
+        var best: ?u32 = null;
+        var best_name: ?[]const u8 = null;
+        while (try it.next()) |entry| {
+            if (entry.kind != .directory) continue;
+            const level = std.fmt.parseInt(u32, entry.name, 10) catch continue;
+            if (level > max_level) continue;
+            if (best == null or level > best.?) {
+                best = level;
+                best_name = b.dupe(entry.name);
+            }
+        }
+        return best_name;
     }
 
     fn findLatestVersionDir(b: *std.Build, base: []const u8) !?[]const u8 {
