@@ -1,7 +1,7 @@
 .{
     .name = .zig_android,
-    .version = "0.0.3",
-    .minimum_zig_version = "0.14.0",
+    .version = "0.0.4",
+    .minimum_zig_version = "0.15.1",
     .paths = .{""},
     .fingerprint = 0xe12cf07563f8291f,
 }

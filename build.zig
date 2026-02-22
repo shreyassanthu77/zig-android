@@ -1,23 +1,52 @@
 const std = @import("std");
-pub const Sdk = @import("sdk.zig");
+pub const Sdk = @import("src/sdk.zig");
 
 pub fn build(b: *std.Build) !void {
-    const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    var sdk = Sdk.init(b, 28);
 
-    var sdk = Sdk.init(b, target, 29) catch {
-        std.log.err("Unsupported target, only x86_64-linux-android and aarch64-linux-android are supported", .{});
-        return;
+    const example = try sdk.createApp(.{
+        .manifest = .{
+            .package = "com.example.app",
+            .uses_sdk = .{
+                .android_minSdkVersion = 24,
+                .android_targetSdkVersion = 29,
+            },
+            .application = .{
+                .android_label = "Example App",
+                .android_hasCode = false,
+                .activity = &.{
+                    Sdk.Application.Manifest.Activity{
+                        .android_name = "android.app.NativeActivity",
+                        .android_exported = true,
+                        .meta_data = &.{
+                            Sdk.Application.Manifest.MetaData{
+                                .android_name = "android.app.lib_name",
+                                .android_value = "main",
+                            },
+                        },
+                        .intent_filter = &.{.main_launcher},
+                    },
+                },
+            },
+        },
+    });
+
+    const targets: []const std.Target.Query = &.{
+        .{ .cpu_arch = .x86_64, .os_tag = .linux, .abi = .android },
+        .{ .cpu_arch = .aarch64, .os_tag = .linux, .abi = .android },
     };
 
-    const example = sdk.addLibrary(.{
-        .name = "example",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("example.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-    const example_step = b.step("example", "Build example");
-    example_step.dependOn(&b.addInstallArtifact(example, .{}).step);
+    for (targets) |target_query| {
+        _ = example.addLibrary(.{
+            .name = "main",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("example.zig"),
+                .target = b.resolveTargetQuery(target_query),
+                .optimize = optimize,
+            }),
+        });
+    }
+
+    example.installApk(".");
 }

@@ -1,24 +1,12 @@
 const std = @import("std");
 const builtin = @import("builtin");
+pub const Application = @import("apk.zig");
 
 build: *std.Build,
 sdk_paths: *SdkPaths,
 
-pub fn init(b: *std.Build, target: std.Build.ResolvedTarget, api_level: u32) !@This() {
-    const sdk_paths = try SdkPaths.init(b, target, api_level);
-
-    const supported = switch (target.result.cpu.arch) {
-        .x86_64, .aarch64 => switch (target.result.os.tag) {
-            .linux => target.result.abi == .android,
-            else => false,
-        },
-        else => false,
-    };
-    if (!supported) {
-        std.log.err("Unsupported target, only x86_64-linux-android and aarch64-linux-android are supported", .{});
-        return error.UnsupportedTarget;
-    }
-
+pub fn init(b: *std.Build, api_level: u32) @This() {
+    const sdk_paths = try SdkPaths.init(b, api_level);
     return .{
         .build = b,
         .sdk_paths = sdk_paths,
@@ -43,19 +31,82 @@ pub fn addRunPlatformTool(self: *@This(), name: []const u8) *std.Build.Step.Run 
 
 pub fn addLibrary(self: *@This(), options: std.Build.LibraryOptions) *std.Build.Step.Compile {
     const b = self.build;
+    const target = options.root_module.resolved_target orelse {
+        @panic("root_module.resolved_target is null");
+    };
+    const lib_paths = switch (target.result.cpu.arch) {
+        .x86_64 => &self.sdk_paths.lib_paths.x86_64,
+        .aarch64 => &self.sdk_paths.lib_paths.aarch64,
+        else => @panic(b.fmt("unsupported target arch: {}", .{target.result.cpu.arch})),
+    };
+
+    const android_target = switch (target.result.cpu.arch) {
+        .x86_64 => b.resolveTargetQuery(.{
+            .cpu_arch = .x86_64,
+            .os_tag = .linux,
+            .abi = .android,
+            .android_api_level = self.sdk_paths.api_level,
+        }),
+        .aarch64 => b.resolveTargetQuery(.{
+            .cpu_arch = .aarch64,
+            .os_tag = .linux,
+            .abi = .android,
+            .android_api_level = self.sdk_paths.api_level,
+        }),
+        else => unreachable,
+    };
 
     var root_module = options.root_module;
-    root_module.addIncludePath(self.sdk_paths.include_dir);
-    root_module.addIncludePath(self.sdk_paths.sys_include_dir);
-    root_module.addLibraryPath(self.sdk_paths.crt_dir);
+    root_module.resolved_target = android_target;
+    root_module.addIncludePath(lib_paths.include_dir);
+    root_module.addIncludePath(lib_paths.sys_include_dir);
+    root_module.addLibraryPath(lib_paths.crt_dir);
 
     var opts = options;
     opts.root_module = root_module;
 
     const lib = b.addLibrary(opts);
-    lib.setLibCFile(self.sdk_paths.libc_file);
+    lib.setLibCFile(lib_paths.libc_file);
+    lib.step.dependOn(&self.sdk_paths.step);
 
     return lib;
+}
+
+pub fn createApp(self: *@This(), options: Application.CreateOptions) !*Application {
+    return Application.create(self, options);
+}
+
+pub fn getDebugKeystore(self: *@This()) std.Build.LazyPath {
+    const b = self.build;
+
+    // Generate a debug keystore in the build cache using keytool.
+    // Uses the same defaults as the standard Android debug keystore:
+    //   alias=androiddebugkey, password=android, CN=Android Debug
+    const keytool = b.addSystemCommand(&.{
+        "keytool",
+        "-genkeypair",
+        "-dname",
+        "CN=Android Debug,O=Android,C=US",
+        "-keystore",
+    });
+
+    if (builtin.zig_version.major == 0 and builtin.zig_version.minor <= 15) {
+        _ = keytool.captureStdErr();
+    } else {
+        _ = keytool.captureStdOut(.{});
+    }
+
+    const keystore = keytool.addOutputFileArg("debug.keystore");
+    keytool.addArgs(&.{
+        "-alias",     "androiddebugkey",
+        "-keypass",   "android",
+        "-storepass", "android",
+        "-keyalg",    "RSA",
+        "-keysize",   "2048",
+        "-validity",  "10000",
+    });
+
+    return keystore;
 }
 
 const SdkPaths = struct {
@@ -72,14 +123,23 @@ const SdkPaths = struct {
     _ndk_dir: std.Build.GeneratedFile,
     ndk_root: std.Build.LazyPath,
 
-    include_dir: std.Build.LazyPath,
-    sys_include_dir: std.Build.LazyPath,
-    crt_dir: std.Build.LazyPath,
+    android_jar: std.Build.LazyPath,
 
     _wf: *std.Build.Step.WriteFile,
-    libc_file: std.Build.LazyPath,
+    lib_paths: struct {
+        x86_64: LibPath,
+        aarch64: LibPath,
+    },
 
-    fn init(b: *std.Build, target: std.Build.ResolvedTarget, api_level: u32) !*SdkPaths {
+    const LibPath = struct {
+        resolved: bool = false,
+        include_dir: std.Build.LazyPath,
+        sys_include_dir: std.Build.LazyPath,
+        crt_dir: std.Build.LazyPath,
+        libc_file: std.Build.LazyPath,
+    };
+
+    fn init(b: *std.Build, api_level: u32) !*SdkPaths {
         const host_os = builtin.os.tag;
         const host_arch = builtin.cpu.arch;
         const prebuilt_dir = switch (host_os) {
@@ -93,11 +153,6 @@ const SdkPaths = struct {
             prebuilt_dir,
             "sysroot",
         });
-        const system_target = switch (target.result.cpu.arch) {
-            .x86_64 => "x86_64-linux-android",
-            .aarch64 => "aarch64-linux-android",
-            else => return error.UnsupportedTarget,
-        };
 
         const self = b.allocator.create(SdkPaths) catch @panic("OOM");
         self.* = .{
@@ -119,17 +174,37 @@ const SdkPaths = struct {
             ._ndk_dir = .{ .step = &self.step },
             .ndk_root = .{ .generated = .{ .file = &self._ndk_dir } },
 
-            .include_dir = self.ndk_root.path(b, b.pathJoin(&.{ sysroot, "usr/include" })),
-            .sys_include_dir = self.include_dir.path(b, system_target),
-            .crt_dir = self.ndk_root.path(b, b.pathJoin(&.{
-                sysroot,
-                "usr/lib",
-                system_target,
-                b.fmt("{d}", .{self.api_level}),
+            .android_jar = self.sdk_root.path(b, b.pathJoin(&.{
+                "platforms",
+                b.fmt("android-{d}", .{api_level}),
+                "android.jar",
             })),
 
             ._wf = b.addWriteFiles(),
-            .libc_file = self._wf.getDirectory().path(b, "android-libc.conf"),
+            .lib_paths = .{
+                .x86_64 = .{
+                    .include_dir = self.ndk_root.path(b, b.pathJoin(&.{ sysroot, "usr/include" })),
+                    .sys_include_dir = self.lib_paths.x86_64.include_dir.path(b, "x86_64-linux-android"),
+                    .crt_dir = self.ndk_root.path(b, b.pathJoin(&.{
+                        sysroot,
+                        "usr/lib",
+                        "x86_64-linux-android",
+                        b.fmt("{d}", .{self.api_level}),
+                    })),
+                    .libc_file = self._wf.getDirectory().path(b, "android-libc-x86_64.conf"),
+                },
+                .aarch64 = .{
+                    .include_dir = self.ndk_root.path(b, b.pathJoin(&.{ sysroot, "usr/include" })),
+                    .sys_include_dir = self.lib_paths.aarch64.include_dir.path(b, "aarch64-linux-android"),
+                    .crt_dir = self.ndk_root.path(b, b.pathJoin(&.{
+                        sysroot,
+                        "usr/lib",
+                        "aarch64-linux-android",
+                        b.fmt("{d}", .{self.api_level}),
+                    })),
+                    .libc_file = self._wf.getDirectory().path(b, "android-libc-aarch64.conf"),
+                },
+            },
         };
         self._wf.step.dependOn(&self.step);
 
@@ -165,7 +240,7 @@ const SdkPaths = struct {
             };
         } else {}
 
-        if (maybe_android_sdk_root == null or !try dirExists(b, maybe_android_sdk_root.?)) blk: {
+        if (maybe_android_sdk_root == null or !try pathExists(b, maybe_android_sdk_root.?)) blk: {
             const maybe_adb_or_aapt = b.findProgram(&.{ "adb", "aapt" }, &[_][]const u8{}) catch break :blk;
 
             const exe_name = std.fs.path.basename(maybe_adb_or_aapt);
@@ -183,7 +258,7 @@ const SdkPaths = struct {
 
         const android_sdk_root = if (maybe_android_sdk_root) |sdk_root| blk: {
             const platform_tools_dir = b.pathResolve(&.{ sdk_root, "platform-tools" });
-            if (!try dirExists(b, platform_tools_dir)) {
+            if (!try pathExists(b, platform_tools_dir)) {
                 std.log.err("platform-tools directory not found at expected location '{s}'", .{platform_tools_dir});
                 return error.AndroidSdkNotFound;
             }
@@ -195,7 +270,7 @@ const SdkPaths = struct {
         };
 
         const build_tools_base = b.pathResolve(&.{ android_sdk_root, "build-tools" });
-        if (!try dirExists(b, build_tools_base)) {
+        if (!try pathExists(b, build_tools_base)) {
             std.log.err("build-tools directory not found at expected location '{s}'", .{build_tools_base});
             return error.AndroidSdkNotFound;
         }
@@ -211,10 +286,10 @@ const SdkPaths = struct {
             const ndk_env_vars = [_][]const u8{ "ANDROID_NDK_HOME", "ANDROID_NDK_PATH", "ANDROID_NDK_ROOT" };
             for (ndk_env_vars) |env_var| {
                 if (env.get(env_var)) |ndk_env| {
-                    if (try dirExists(b, ndk_env)) {
+                    if (try pathExists(b, ndk_env)) {
                         // Check if this is a direct NDK root (has toolchains/ inside)
                         const toolchains = b.pathResolve(&.{ ndk_env, "toolchains" });
-                        if (try dirExists(b, toolchains)) {
+                        if (try pathExists(b, toolchains)) {
                             break :blk ndk_env;
                         }
                         // Otherwise treat it as a parent dir containing version subdirs
@@ -228,7 +303,7 @@ const SdkPaths = struct {
 
             // Fallback: look in <sdk_root>/ndk/
             const ndk_base = b.pathResolve(&.{ android_sdk_root, "ndk" });
-            if (!try dirExists(b, ndk_base)) {
+            if (!try pathExists(b, ndk_base)) {
                 std.log.err("NDK not found. Please install the NDK or set ANDROID_NDK_HOME.", .{});
                 return error.AndroidSdkNotFound;
             }
@@ -243,48 +318,92 @@ const SdkPaths = struct {
         self._build_tools_dir.path = build_tools_dir;
         self._ndk_dir.path = ndk_root;
 
-        // create libc file
-        const include_dir = try self.include_dir.getPath3(b, step).toString(b.allocator);
-        const sys_include_dir = try self.sys_include_dir.getPath3(b, step).toString(b.allocator);
-        const crt_dir = try self.crt_dir.getPath3(b, step).toString(b.allocator);
-
-        if (!try dirExists(b, crt_dir)) {
+        const android_jar = try self.android_jar.getPath3(b, step).toString(b.allocator);
+        if (!try pathExists(b, android_jar)) {
             std.log.err(
-                "API level {d} not found in NDK sysroot. Directory '{s}' does not exist. " ++
-                    "Check your installed NDK for available API levels.",
-                .{ self.api_level, crt_dir },
+                "android.jar not found for API level {d}. Expected at '{s}'. " ++
+                    "Make sure the Android SDK platform for API level {d} is installed " ++
+                    "(install via `sdkmanager \"platforms;android-{d}\"`).",
+                .{ self.api_level, android_jar, self.api_level, self.api_level },
             );
-            return error.InvalidApiLevel;
+            return error.AndroidPlatformNotFound;
         }
 
-        const libc_contents = b.fmt(
-            \\# Generated by zig-android-sdk. DO NOT EDIT.
-            \\
-            \\# The directory that contains `stdlib.h`.
-            \\# On POSIX-like systems, include directories be found with: `cc -E -Wp,-v -xc /dev/null`
-            \\include_dir={s}
-            \\
-            \\# The system-specific include directory. May be the same as `include_dir`.
-            \\# On Windows it's the directory that includes `vcruntime.h`.
-            \\# On POSIX it's the directory that includes `sys/errno.h`.
-            \\sys_include_dir={s}
-            \\
-            \\# The directory that contains `crt1.o`.
-            \\# On POSIX, can be found with `cc -print-file-name=crt1.o`.
-            \\# Not needed when targeting MacOS.
-            \\crt_dir={s}
-            \\
-            \\# The directory that contains `vcruntime.lib`.
-            \\# Only needed when targeting MSVC on Windows.
-            \\msvc_lib_dir=
-            \\
-            \\# The directory that contains `kernel32.lib`.
-            \\# Only needed when targeting MSVC on Windows.
-            \\kernel32_lib_dir=
-            \\
-            \\gcc_dir=
-        , .{ include_dir, sys_include_dir, crt_dir });
-        _ = self._wf.add("android-libc.conf", libc_contents);
+        // x86_64 lib paths
+        const x86_64_include_dir = try self.lib_paths.x86_64.include_dir.getPath3(b, step).toString(b.allocator);
+        const x86_64_sys_include_dir = try self.lib_paths.x86_64.sys_include_dir.getPath3(b, step).toString(b.allocator);
+        const x86_64_crt_dir = try self.lib_paths.x86_64.crt_dir.getPath3(b, step).toString(b.allocator);
+
+        if (try pathExists(b, x86_64_crt_dir)) {
+            self.lib_paths.x86_64.resolved = true;
+
+            const x86_64_libc_contents = b.fmt(
+                \\# Generated by zig-android-sdk. DO NOT EDIT.
+                \\
+                \\# The directory that contains `stdlib.h`.
+                \\# On POSIX-like systems, include directories be found with: `cc -E -Wp,-v -xc /dev/null`
+                \\include_dir={s}
+                \\
+                \\# The system-specific include directory. May be the same as `include_dir`.
+                \\# On Windows it's the directory that includes `vcruntime.h`.
+                \\# On POSIX it's the directory that includes `sys/errno.h`.
+                \\sys_include_dir={s}
+                \\
+                \\# The directory that contains `crt1.o`.
+                \\# On POSIX, can be found with `cc -print-file-name=crt1.o`.
+                \\# Not needed when targeting MacOS.
+                \\crt_dir={s}
+                \\
+                \\# The directory that contains `vcruntime.lib`.
+                \\# Only needed when targeting MSVC on Windows.
+                \\msvc_lib_dir=
+                \\
+                \\# The directory that contains `kernel32.lib`.
+                \\# Only needed when targeting MSVC on Windows.
+                \\kernel32_lib_dir=
+                \\
+                \\gcc_dir=
+            , .{ x86_64_include_dir, x86_64_sys_include_dir, x86_64_crt_dir });
+            _ = self._wf.add("android-libc-x86_64.conf", x86_64_libc_contents);
+        }
+
+        // aarch64 lib paths
+        const aarch64_include_dir = try self.lib_paths.aarch64.include_dir.getPath3(b, step).toString(b.allocator);
+        const aarch64_sys_include_dir = try self.lib_paths.aarch64.sys_include_dir.getPath3(b, step).toString(b.allocator);
+        const aarch64_crt_dir = try self.lib_paths.aarch64.crt_dir.getPath3(b, step).toString(b.allocator);
+
+        if (try pathExists(b, aarch64_crt_dir)) {
+            self.lib_paths.aarch64.resolved = true;
+
+            const aarch64_libc_contents = b.fmt(
+                \\# Generated by zig-android-sdk. DO NOT EDIT.
+                \\
+                \\# The directory that contains `stdlib.h`.
+                \\# On POSIX-like systems, include directories be found with: `cc -E -Wp,-v -xc /dev/null`
+                \\include_dir={s}
+                \\
+                \\# The system-specific include directory. May be the same as `include_dir`.
+                \\# On Windows it's the directory that includes `vcruntime.h`.
+                \\# On POSIX it's the directory that includes `sys/errno.h`.
+                \\sys_include_dir={s}
+                \\
+                \\# The directory that contains `crt1.o`.
+                \\# On POSIX, can be found with `cc -print-file-name=crt1.o`.
+                \\# Not needed when targeting MacOS.
+                \\crt_dir={s}
+                \\
+                \\# The directory that contains `vcruntime.lib`.
+                \\# Only needed when targeting MSVC on Windows.
+                \\msvc_lib_dir=
+                \\
+                \\# The directory that contains `kernel32.lib`.
+                \\# Only needed when targeting MSVC on Windows.
+                \\kernel32_lib_dir=
+                \\
+                \\gcc_dir=
+            , .{ aarch64_include_dir, aarch64_sys_include_dir, aarch64_crt_dir });
+            _ = self._wf.add("android-libc-aarch64.conf", aarch64_libc_contents);
+        }
     }
 
     fn findLatestVersionDir(b: *std.Build, base: []const u8) !?[]const u8 {
@@ -352,16 +471,16 @@ const SdkPaths = struct {
         }
     };
 
-    fn dirExists(b: *std.Build, dir: []const u8) !bool {
+    fn pathExists(b: *std.Build, path: []const u8) !bool {
         if (@hasDecl(std, "Io") and @hasDecl(std.Io, "Dir") and @hasDecl(std.Io.Dir, "accessAbsolute")) {
-            std.Io.Dir.accessAbsolute(b.graph.io, dir, .{
+            std.Io.Dir.accessAbsolute(b.graph.io, path, .{
                 .read = true,
             }) catch |err| switch (err) {
                 error.FileNotFound => return false,
                 else => |e| return e,
             };
         } else if (@hasDecl(std.fs, "accessAbsolute")) {
-            std.fs.accessAbsolute(dir, .{}) catch |err| switch (err) {
+            std.fs.accessAbsolute(path, .{}) catch |err| switch (err) {
                 error.FileNotFound => return false,
                 else => |e| return e,
             };
