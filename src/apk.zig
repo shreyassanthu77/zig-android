@@ -68,11 +68,16 @@ pub fn create(sdk: *Sdk, options: CreateOptions) !*Application {
 
     return self;
 }
-
-pub fn installApk(self: *Application, dest_rel_path: []const u8) void {
+pub fn addInstallApk(self: *Application, dest_rel_path: []const u8) *std.Build.Step.InstallFile {
     const b = self.sdk.build;
     const apk_name = b.fmt("{s}.apk", .{self.manifest.package});
     const install = b.addInstallFile(self.aligned_apk, b.pathJoin(&.{ dest_rel_path, apk_name }));
+    return install;
+}
+
+pub fn installApk(self: *Application, dest_rel_path: []const u8) void {
+    const b = self.sdk.build;
+    const install = self.addInstallApk(dest_rel_path);
     b.getInstallStep().dependOn(&install.step);
 }
 
