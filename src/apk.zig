@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const Sdk = @import("sdk.zig");
 const util = @import("util.zig");
 pub const Manifest = @import("android_manifest.zig");
@@ -96,7 +97,7 @@ pub fn create(sdk: *Sdk, options: CreateOptions) !*Application {
 
     const apksigner = sdk.addRunBuildTool("apksigner");
     apksigner.addArgs(&.{ "sign", "--ks" });
-    apksigner.addFileArg(sdk.getDebugKeystore());
+    apksigner.addFileArg(self.getDebugKeystore());
     apksigner.addArgs(&.{ "--ks-pass", "pass:android", "--out" });
     const signed_apk = apksigner.addOutputFileArg(b.fmt("{s}.apk", .{options.manifest.package}));
     apksigner.addFileArg(aligned_apk);
@@ -166,4 +167,37 @@ fn make(step: *std.Build.Step, options: std.Build.Step.MakeOptions) !void {
     try self.manifest.toXml(&manifest_writer.writer);
     try manifest_writer.writer.flush(); // noop but not a bad idea to have it here
     _ = wf.add("work/AndroidManifest.xml", manifest_writer.written());
+}
+
+pub fn getDebugKeystore(self: *@This()) std.Build.LazyPath {
+    const b = self.sdk.build;
+
+    // Generate a debug keystore in the build cache using keytool.
+    // Uses the same defaults as the standard Android debug keystore:
+    //   alias=androiddebugkey, password=android, CN=Android Debug
+    const keytool = b.addSystemCommand(&.{
+        "keytool",
+        "-genkeypair",
+        "-dname",
+        "CN=Android Debug,O=Android,C=US",
+        "-keystore",
+    });
+
+    if (builtin.zig_version.major == 0 and builtin.zig_version.minor <= 15) {
+        _ = keytool.captureStdErr();
+    } else {
+        _ = keytool.captureStdErr(.{});
+    }
+
+    const keystore = keytool.addOutputFileArg("debug.keystore");
+    keytool.addArgs(&.{
+        "-alias",     "androiddebugkey",
+        "-keypass",   "android",
+        "-storepass", "android",
+        "-keyalg",    "RSA",
+        "-keysize",   "2048",
+        "-validity",  "10000",
+    });
+
+    return keystore;
 }
