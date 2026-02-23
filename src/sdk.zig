@@ -234,7 +234,7 @@ const SdkPaths = struct {
             };
         } else {}
 
-        if (maybe_android_sdk_root == null or !try pathExists(b, maybe_android_sdk_root.?)) blk: {
+        if (maybe_android_sdk_root == null or !try util.pathExists(b, maybe_android_sdk_root.?)) blk: {
             const maybe_adb_or_aapt = b.findProgram(&.{ "adb", "aapt" }, &[_][]const u8{}) catch break :blk;
 
             const exe_name = std.fs.path.basename(maybe_adb_or_aapt);
@@ -252,7 +252,7 @@ const SdkPaths = struct {
 
         const android_sdk_root = if (maybe_android_sdk_root) |sdk_root| blk: {
             const platform_tools_dir = b.pathResolve(&.{ sdk_root, "platform-tools" });
-            if (!try pathExists(b, platform_tools_dir)) {
+            if (!try util.pathExists(b, platform_tools_dir)) {
                 std.log.err("platform-tools directory not found at expected location '{s}'", .{platform_tools_dir});
                 return error.AndroidSdkNotFound;
             }
@@ -264,7 +264,7 @@ const SdkPaths = struct {
         };
 
         const build_tools_base = b.pathResolve(&.{ android_sdk_root, "build-tools" });
-        if (!try pathExists(b, build_tools_base)) {
+        if (!try util.pathExists(b, build_tools_base)) {
             std.log.err("build-tools directory not found at expected location '{s}'", .{build_tools_base});
             return error.AndroidSdkNotFound;
         }
@@ -280,10 +280,10 @@ const SdkPaths = struct {
             const ndk_env_vars = [_][]const u8{ "ANDROID_NDK_HOME", "ANDROID_NDK_PATH", "ANDROID_NDK_ROOT" };
             for (ndk_env_vars) |env_var| {
                 if (env.get(env_var)) |ndk_env| {
-                    if (try pathExists(b, ndk_env)) {
+                    if (try util.pathExists(b, ndk_env)) {
                         // Check if this is a direct NDK root (has toolchains/ inside)
                         const toolchains = b.pathResolve(&.{ ndk_env, "toolchains" });
-                        if (try pathExists(b, toolchains)) {
+                        if (try util.pathExists(b, toolchains)) {
                             break :blk ndk_env;
                         }
                         // Otherwise treat it as a parent dir containing version subdirs
@@ -297,7 +297,7 @@ const SdkPaths = struct {
 
             // Fallback: look in <sdk_root>/ndk/
             const ndk_base = b.pathResolve(&.{ android_sdk_root, "ndk" });
-            if (!try pathExists(b, ndk_base)) {
+            if (!try util.pathExists(b, ndk_base)) {
                 std.log.err("NDK not found. Please install the NDK or set ANDROID_NDK_HOME.", .{});
                 return error.AndroidSdkNotFound;
             }
@@ -324,7 +324,7 @@ const SdkPaths = struct {
             return error.AndroidPlatformNotFound;
         };
         const android_jar_path = b.pathResolve(&.{ platforms_base, best_platform, "android.jar" });
-        if (!try pathExists(b, android_jar_path)) {
+        if (!try util.pathExists(b, android_jar_path)) {
             std.log.err(
                 "android.jar not found at '{s}'. The platform directory exists but appears incomplete.",
                 .{android_jar_path},
@@ -480,24 +480,5 @@ const SdkPaths = struct {
             }
         }
         return if (latest_ver) |_| b.dupe(latest_ver_str.?) else null;
-    }
-
-    fn pathExists(b: *std.Build, path: []const u8) !bool {
-        if (@hasDecl(std, "Io") and @hasDecl(std.Io, "Dir") and @hasDecl(std.Io.Dir, "accessAbsolute")) {
-            std.Io.Dir.accessAbsolute(b.graph.io, path, .{
-                .read = true,
-            }) catch |err| switch (err) {
-                error.FileNotFound => return false,
-                else => |e| return e,
-            };
-        } else if (@hasDecl(std.fs, "accessAbsolute")) {
-            std.fs.accessAbsolute(path, .{}) catch |err| switch (err) {
-                error.FileNotFound => return false,
-                else => |e| return e,
-            };
-        } else {
-            @compileError("Unsupported Zig version");
-        }
-        return true;
     }
 };

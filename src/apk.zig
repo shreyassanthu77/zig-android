@@ -162,10 +162,9 @@ fn make(step: *std.Build.Step, options: std.Build.Step.MakeOptions) !void {
     const self: *Application = @fieldParentPtr("step", step);
     const wf = self.wf;
 
-    var manifest_writer = std.Io.Writer.Allocating.init(b.allocator);
+    var manifest_writer = util.AllocatingWriter.init(b.allocator);
     defer manifest_writer.deinit();
-    try self.manifest.toXml(&manifest_writer.writer);
-    try manifest_writer.writer.flush(); // noop but not a bad idea to have it here
+    try self.manifest.toXml(manifest_writer.writer());
     _ = wf.add("work/AndroidManifest.xml", manifest_writer.written());
 }
 

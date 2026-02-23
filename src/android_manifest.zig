@@ -38,7 +38,7 @@ uses_permission: ?[]const UsesPermission = null,
 compatible_screens: ?CompatibleScreens = null,
 attribution: ?[]const Attribution = null,
 
-pub fn toXml(self: Manifest, w: *std.Io.Writer) !void {
+pub fn toXml(self: Manifest, w: anytype) !void {
     try structToXMLTag(w, "manifest", self, 0);
 }
 
@@ -823,7 +823,7 @@ pub const PathPermission = struct {
     android_writePermission: ?[]const u8 = null,
 };
 
-fn structToXMLTag(w: *std.Io.Writer, comptime name: []const u8, value: anytype, comptime depth: u32) !void {
+fn structToXMLTag(w: anytype, comptime name: []const u8, value: anytype, comptime depth: u32) !void {
     const V = @TypeOf(value);
     const v_info = @typeInfo(V);
     switch (v_info) {
@@ -840,7 +840,7 @@ fn structToXMLTag(w: *std.Io.Writer, comptime name: []const u8, value: anytype, 
                     else => c,
                 };
             }
-            try w.splatByteAll(' ', depth * 2);
+            try splatByte(w, ' ', depth * 2);
             try w.print("<{s}", .{transformed_name});
             inline for (struct_info.fields) |*field| {
                 const FieldType = field.type;
@@ -877,14 +877,14 @@ fn structToXMLTag(w: *std.Io.Writer, comptime name: []const u8, value: anytype, 
                     try structToXMLTag(w, field.name, @field(value, field.name), depth + 1);
                 }
             }
-            try w.splatByteAll(' ', depth * 2);
+            try splatByte(w, ' ', depth * 2);
             try w.print("</{s}>\n", .{transformed_name});
         },
         else => @compileError(std.fmt.comptimePrint("expected struct, found {s}", .{@typeName(V)})),
     }
 }
 
-fn writeAttribute(w: *std.Io.Writer, comptime name: []const u8, value: anytype, depth: u32) !void {
+fn writeAttribute(w: anytype, comptime name: []const u8, value: anytype, depth: u32) !void {
     comptime var transformed_name: [name.len]u8 = undefined;
     inline for (name, 0..) |c, i| {
         transformed_name[i] = switch (c) {
@@ -899,12 +899,12 @@ fn writeAttribute(w: *std.Io.Writer, comptime name: []const u8, value: anytype, 
         [:0]const u8,
         => {
             try w.writeByte('\n');
-            try w.splatByteAll(' ', depth * 2);
+            try splatByte(w, ' ', depth * 2);
             try w.print("{s}=\"{s}\"", .{ transformed_name, value });
         },
         i32, bool => {
             try w.writeByte('\n');
-            try w.splatByteAll(' ', depth * 2);
+            try splatByte(w, ' ', depth * 2);
             try w.print("{s}=\"{}\"", .{ transformed_name, value });
         },
         else => {
@@ -915,7 +915,7 @@ fn writeAttribute(w: *std.Io.Writer, comptime name: []const u8, value: anytype, 
                 .pointer => |info| switch (info.size) {
                     .slice => {
                         try w.writeByte('\n');
-                        try w.splatByteAll(' ', depth * 2);
+                        try splatByte(w, ' ', depth * 2);
                         try w.print("{s}=\"", .{transformed_name});
                         for (value, 0..) |v, i| {
                             if (i != 0) try w.print("|", .{});
@@ -934,5 +934,12 @@ fn writeAttribute(w: *std.Io.Writer, comptime name: []const u8, value: anytype, 
                 else => @compileError(std.fmt.comptimePrint("unhandled type {s}", .{@typeName(V)})),
             }
         },
+    }
+}
+
+fn splatByte(w: anytype, byte: u8, count: u32) !void {
+    var i: u32 = 0;
+    while (i < count) : (i += 1) {
+        try w.writeByte(byte);
     }
 }
